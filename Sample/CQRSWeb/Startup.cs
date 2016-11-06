@@ -3,60 +3,61 @@ using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using Autofac;
+using Autofac.Extensions.DependencyInjection;
 using CQRSlite.Bus;
 using CQRSlite.Commands;
 using CQRSlite.Events;
 using CQRSlite.Domain;
 using CQRSCode.WriteModel;
 using CQRSlite.Cache;
-using Microsoft.Extensions.Caching.Memory;
 using CQRSCode.ReadModel;
-using CQRSlite.Config;
 using CQRSCode.WriteModel.Handlers;
-using Scrutor;
 using System.Reflection;
 using System.Linq;
+using CQRSlite.Config;
+
 
 namespace CQRSWeb
 {
     public class Startup
     {
-        // This method gets called by the runtime. Use this method to add services to the container.
-        public void ConfigureServices(IServiceCollection services)
+        public IContainer ApplicationContainer { get; private set; }
+        public IServiceProvider ConfigureServices(IServiceCollection services)
         {
+            services.AddMvc();
             services.AddMemoryCache();
+            var builder = new ContainerBuilder();
 
-            //Add Cqrs services
             services.AddSingleton<InProcessBus>(new InProcessBus());
-            services.AddSingleton<ICommandSender>(y => y.GetService<InProcessBus>());
-            services.AddSingleton<IEventPublisher>(y => y.GetService<InProcessBus>());
-            services.AddSingleton<IHandlerRegistrar>(y => y.GetService<InProcessBus>());
-            services.AddScoped<ISession, Session>();
-            services.AddSingleton<IEventStore, InMemoryEventStore>();
-            services.AddScoped<IRepository>(y => new CacheRepository(new Repository(y.GetService<IEventStore>()), y.GetService<IEventStore>(), y.GetService<ICache>()));
+            builder.Register<ICommandSender>(c => c.Resolve<InProcessBus>()).SingleInstance();
+            builder.Register<IEventPublisher>(c => c.Resolve<InProcessBus>()).SingleInstance();
+            builder.Register<IHandlerRegistrar>(c => c.Resolve<InProcessBus>());
+            builder.RegisterType<Session>().As<ISession>().InstancePerLifetimeScope();
+            builder.RegisterType<InMemoryEventStore>().As<IEventStore>().SingleInstance();
+            builder.RegisterType<MemoryCache>().As<ICache>().InstancePerLifetimeScope();
+            builder.Register<IRepository>(x =>
+                new CacheRepository(new Repository(x.Resolve<IEventStore>()),
+                x.Resolve<IEventStore>(), x.Resolve<ICache>())).InstancePerLifetimeScope();
+            builder.RegisterType<ReadModelFacade>().As<IReadModelFacade>().InstancePerDependency();
+            var targetAssembly = typeof(InventoryCommandHandlers).GetTypeInfo().Assembly;
 
-            services.AddTransient<IReadModelFacade, ReadModelFacade>();
+            builder.RegisterAssemblyTypes(targetAssembly)
+                .As(type => type.GetInterfaces()
+                    .Where(interfacetype => interfacetype.IsAssignableFrom(typeof(ICommandHandler<>))
+                            || interfacetype.IsAssignableFrom(typeof(IEventHandler<>))))
+                     .AsSelf()
+                .InstancePerDependency();
 
-            //Scan for commandhandlers and eventhandlers
-            services.Scan(scan => scan
-                .FromAssemblies(typeof(InventoryCommandHandlers).GetTypeInfo().Assembly)
-                    .AddClasses(classes => classes.Where(x => {
-                        var allInterfaces = x.GetInterfaces();
-                        return 
-                            allInterfaces.Any(y => y.GetTypeInfo().IsGenericType && y.GetTypeInfo().GetGenericTypeDefinition() == typeof(ICommandHandler<>)) ||
-                            allInterfaces.Any(y => y.GetTypeInfo().IsGenericType && y.GetTypeInfo().GetGenericTypeDefinition() == typeof(IEventHandler<>));
-                    }))
-                    .AsSelf()
-                    .WithTransientLifetime()
-            );
+            builder.Populate(services);
+            this.ApplicationContainer = builder.Build();
 
-            //Register bus
-            var serviceProvider = services.BuildServiceProvider();
-            var registrar = new BusRegistrar(new DependencyResolver(serviceProvider));
+            var autofacServiceProvider = new AutofacServiceProvider(ApplicationContainer);
+            var registrar = new BusRegistrar(new DependencyResolver(autofacServiceProvider));
             registrar.Register(typeof(InventoryCommandHandlers));
 
-            // Add framework services.
-            services.AddMvc();
+
+            return autofacServiceProvider;
         }
 
         // This method gets called by the runtime. Use this method to configure the HTTP request pipeline.
